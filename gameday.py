@@ -5,6 +5,7 @@
   python gameday.py --team KC           follow a different NFL team (ESPN abbreviation)
   python gameday.py --delay 20          hold every reaction 20 s (if the lights spoil plays on your TV)
   python gameday.py --replay EVENT TEAM dry run: print what WOULD have fired for a finished/in-progress game (no lights)
+  python gameday.py --team KC --dry     watch a live game and print triggers, no lights
   python gameday.py --demo              10 s ambient, then one touchdown burst, then restore
 
 Stop with Ctrl+C (lights are restored), or create a file named STOP next to this script.
@@ -18,7 +19,8 @@ def _cfg():
 BRIDGE=os.environ.get("HUE_BRIDGE_IP") or _cfg().get("bridge_ip","")   # set by --pair, or edit config.json
 TEAM="SEA"
 ESPN="https://site.api.espn.com/apis/site/v2/sports/football/nfl/"
-POLL=10           # seconds between feed checks
+FAST_POLL=4       # seconds between scoreboard checks (newest play, arrives first)
+FULL_POLL=15      # seconds between full play-by-play checks (backstop: catches anything the fast feed skipped)
 NAVY=([0.157,0.08],65); GREEN=([0.26,0.64],190); GREY=([0.3041,0.3248],170)
 PAL=[NAVY,GREEN,NAVY,GREY,GREEN]
 WILD=[([0.26,0.64],254),([0.157,0.08],254),([0.3127,0.329],254),([0.26,0.64],254)]  # green, electric blue, white
@@ -124,59 +126,90 @@ def replay(event,team):
         hit=classify(poss,p,team,side,score); score=max(score,p.get(side,score))
         if hit: print(f"Q{p['period']['number']} {p['clock']['displayValue']:>5}  {hit[0]:>2}s  {hit[1]:<22} {p.get('text','').strip()[:80]}")
 
-def live(delay,demo=False):
-    lights,ids=reachable()
-    if not os.path.exists(saved): json.dump({i:lights[i]["state"] for i in ids},open(saved,"w"))
+def fast_play(event,team):
+    """Newest play from the scoreboard endpoint, which runs up to ~20 s ahead of the full summary.
+    Returns (status, our_score, play_id, poss_abbr, play_dict) - play fields are None between plays."""
+    for e in get(ESPN+"scoreboard")["events"]:
+        if e["id"]!=event: continue
+        c=e["competitions"][0]; abbr={t["team"]["id"]:t["team"]["abbreviation"] for t in c["competitors"]}
+        ours=int([t.get("score") or 0 for t in c["competitors"] if t["team"]["abbreviation"]==team][0])
+        st=c["status"]["type"]["name"]; lp=(c.get("situation") or {}).get("lastPlay")
+        if not lp or not lp.get("id"): return st,ours,None,None,None
+        typ=(lp.get("type") or {}).get("text","")
+        # punts sit in the punting team's drive; everything else belongs to lastPlay.team
+        tid=((lp.get("start") or {}).get("team") or {}).get("id") if typ=="Punt" else (lp.get("team") or {}).get("id")
+        return st,ours,str(lp["id"]),abbr.get(tid,""),lp
+    return None,0,None,None,None
+
+def live(delay,demo=False,dry=False):
+    global put
+    if dry: put=lambda *a,**k: None; ids=["0"]
+    else:
+        lights,ids=reachable()
+        if not os.path.exists(saved): json.dump({i:lights[i]["state"] for i in ids},open(saved,"w"))
     if os.path.exists(stop): os.remove(stop)
-    log(f"{len(ids)} lights. Ctrl+C to stop and restore.")
+    log(f"{len(ids)} lights. Ctrl+C to stop and restore." if not dry else "DRY RUN - no lights, printing triggers only.")
     try:
         if demo:
             ambient_step(ids,1); time.sleep(10); log("demo TOUCHDOWN"); wild(ids,15); return
         event,name,side=find_game(TEAM)
         if not event: log("No",TEAM,"game on today's scoreboard."); return
         log("Tracking:",name,"| event",event,"| reaction delay",delay,"s")
-        seen=None; score=0; step=0; next_poll=0; queue=[]; state=""
+        seen=None; score=0; step=0; next_fast=0; next_full=0; queue=[]; state=""; last_fire=0
+        def consider(pid,poss,p,src):
+            nonlocal score,last_fire
+            if pid in seen: return
+            seen.add(pid)
+            hit=classify(poss,p,TEAM,side,score); score=max(score,p.get(side,score))
+            if not hit: return
+            is_score=hit[1] in ("TOUCHDOWN","FIELD GOAL","SAFETY / 2-PT")
+            if not is_score and time.time()-last_fire<40: return      # same play seen twice via the two feeds
+            last_fire=time.time(); queue.append((time.time()+delay,hit,f"[{src}] "+(p.get("text") or "").strip()[:90]))
         while not os.path.exists(stop):
             now=time.time()
-            if now>=next_poll:
-                next_poll=now+POLL
+            if now>=next_full:                                         # full play-by-play: complete, but slower
+                next_full=now+FULL_POLL
                 try:
-                    s=get(ESPN+"summary?event="+event)
-                    st=s["header"]["competitions"][0]["status"]["type"]["name"]
-                    if st!=state: state=st; log("game status:",st)
-                    plays=all_plays(s)
-                    if seen is None:                      # started mid-game: don't replay history
+                    s=get(ESPN+"summary?event="+event); plays=all_plays(s)
+                    if seen is None:                                   # started mid-game: don't replay history
                         seen=set(plays); score=max([p.get(side,0) for _,p in plays.values()] or [0])
                     for pid,(poss,p) in sorted(plays.items(),key=lambda kv:int(kv[1][1].get("sequenceNumber",0))):
-                        if pid in seen: continue
-                        seen.add(pid)
-                        hit=classify(poss,p,TEAM,side,score); score=max(score,p.get(side,score))
-                        if hit: queue.append((now+delay,hit,p.get("text","").strip()[:90]))
+                        consider(pid,poss,p,"summary")
+                except Exception as e: log("summary feed hiccup:",e)
+            if now>=next_fast and seen is not None:                    # scoreboard lastPlay: newest play only, but first
+                next_fast=now+FAST_POLL
+                try:
+                    st,ours,pid,poss,lp=fast_play(event,TEAM)
+                    if st and st!=state: state=st; log("game status:",st)
+                    if pid:
+                        p=dict(lp); p[side]=ours; consider(pid,poss,p,"scoreboard")
                     if st=="STATUS_FINAL" and not queue:
-                        comp=s["header"]["competitions"][0]["competitors"]
+                        comp=get(ESPN+"summary?event="+event)["header"]["competitions"][0]["competitors"]
                         won=[c for c in comp if c["team"]["abbreviation"]==TEAM][0].get("winner")
-                        log("FINAL.","SEAHAWKS WIN!" if won else "")
+                        log("FINAL.",TEAM+" WIN!" if won else "")
                         if won: wild(ids,60)
                         return
-                except Exception as e: log("feed hiccup:",e)
+                except Exception as e: log("scoreboard feed hiccup:",e)
             due=[q for q in queue if q[0]<=time.time()]
             if due:
                 queue=[q for q in queue if q not in due]
                 secs=max(q[1][0] for q in due)
                 for q in due: log("BIG PLAY:",q[1][1],"|",q[2])
-                wild(ids,secs); step+=1; ambient_step(ids,step)
+                wild(ids,secs if not dry else 0); step+=1; ambient_step(ids,step)
             else:
                 step+=1; ambient_step(ids,step)
-                t=time.time()+5                        # slow loop: ~6 s per step, 2.5 s fades
-                while time.time()<t and not os.path.exists(stop) and time.time()<next_poll: time.sleep(0.5)
+                t=time.time()+5                                        # slow loop: ~6 s per step, 2.5 s fades
+                while time.time()<t and not os.path.exists(stop) and time.time()<min(next_fast,next_full): time.sleep(0.25)
     except KeyboardInterrupt: log("stopping")
-    finally: restore()
+    finally:
+        if not dry: restore()
 
 if __name__=="__main__":
     a=sys.argv[1:]
     if "--team" in a: TEAM=a[a.index("--team")+1].upper()
     if a[:1]==["--pair"]: pair()
-    elif not BRIDGE and a[:1]!=["--replay"]: sys.exit("No bridge configured. Run: python gameday.py --pair")
+    elif not BRIDGE and a[:1]!=["--replay"] and "--dry" not in a: sys.exit("No bridge configured. Run: python gameday.py --pair")
     elif a[:1]==["--replay"]: replay(a[1],a[2])
     elif a[:1]==["--demo"]: live(0,demo=True)
+    elif "--dry" in a: live(0,dry=True)
     else: live(float(a[a.index("--delay")+1]) if "--delay" in a else 0)

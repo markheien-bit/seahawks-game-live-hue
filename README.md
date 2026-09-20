@@ -41,6 +41,7 @@ Requires Python 3.9+ and a Hue Bridge on the same network as the computer.
 python gameday.py                 # follow today's Seahawks game on every reachable light
 python gameday.py --team KC       # follow another team (ESPN abbreviation)
 python gameday.py --delay 20      # hold every reaction 20 s
+python gameday.py --team KC --dry # watch a live game and print triggers, no lights
 python gameday.py --demo          # 10 s of the loop, one touchdown burst, restore
 python gameday.py --replay 401872932 BUF   # dry run against any game: print what would have fired, no lights
 ```
@@ -53,7 +54,7 @@ ESPN's feed usually trails the live action by 20–60 seconds. On cable or anten
 
 ## How it works
 
-- Polls `site.api.espn.com/.../summary?event=<id>` every 10 seconds and diffs the play list against plays already seen.
+- Two ESPN endpoints, deduplicated by play id. The **scoreboard** endpoint's `situation.lastPlay` is checked every 4 seconds: it carries only the newest play, but in testing it showed a new play up to ~20 seconds before the full feed did. The **summary** play-by-play is checked every 15 seconds as a backstop, so a play the fast feed skips (no-huddle, or a play that lands during a burst) still fires.
 - Scores are detected from the change in the team's running score, so a touchdown fires however ESPN labels the play. Everything else is classified from the play type, yardage, and which team had possession.
 - Lights are driven through the bridge's local REST API. That API is limited to roughly 10 commands a second, so the "wild" mode hits a random handful of lights each beat rather than all of them — it reads as faster than cycling every light in order.
 - Colours are CIE xy values. The literal hex conversions of navy and green look washed-out on a bulb, so both are pushed deeper and more saturated than the official swatches.
