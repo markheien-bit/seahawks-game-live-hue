@@ -10,6 +10,7 @@ One Python file, standard library only. No cloud account, no subscription — it
 
 | Play | Burst |
 |---|---|
+| Kickoff (with `--at-kickoff`) | 20 s |
 | Touchdown | 30 s |
 | Interception / fumble recovery | 20 s |
 | Safety, two-point conversion, blocked kick | 15 s |
@@ -39,6 +40,7 @@ Requires Python 3.9+ and a Hue Bridge on the same network as the computer.
 
 ```
 python gameday.py                 # follow today's Seahawks game on every reachable light
+python gameday.py --at-kickoff    # leave the lights alone until the game starts, flash 20 s for kickoff, then go live
 python gameday.py --team KC       # follow another team (ESPN abbreviation)
 python gameday.py --delay 20      # hold every reaction 20 s
 python gameday.py --team KC --dry # watch a live game and print triggers, no lights

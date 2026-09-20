@@ -2,6 +2,7 @@
 
   python gameday.py --pair              one-time setup: press the bridge's link button first, then run this
   python gameday.py                     live: SEA, today's game, all reachable lights
+  python gameday.py --at-kickoff        wait (lights untouched) until the game starts, flash 20 s for kickoff, then go live
   python gameday.py --team KC           follow a different NFL team (ESPN abbreviation)
   python gameday.py --delay 20          hold every reaction 20 s (if the lights spoil plays on your TV)
   python gameday.py --replay EVENT TEAM dry run: print what WOULD have fired for a finished/in-progress game (no lights)
@@ -141,7 +142,7 @@ def fast_play(event,team):
         return st,ours,str(lp["id"]),abbr.get(tid,""),lp
     return None,0,None,None,None
 
-def live(delay,demo=False,dry=False):
+def live(delay,demo=False,dry=False,kickoff=False):
     global put
     if dry: put=lambda *a,**k: None; ids=["0"]
     else:
@@ -155,6 +156,9 @@ def live(delay,demo=False,dry=False):
         event,name,side=find_game(TEAM)
         if not event: log("No",TEAM,"game on today's scoreboard."); return
         log("Tracking:",name,"| event",event,"| reaction delay",delay,"s")
+        if kickoff:
+            if delay: time.sleep(delay)
+            log("KICKOFF - flashing"); wild(ids,20)
         seen=None; score=0; step=0; next_fast=0; next_full=0; queue=[]; state=""; last_fire=0
         def consider(pid,poss,p,src):
             nonlocal score,last_fire
@@ -212,4 +216,16 @@ if __name__=="__main__":
     elif a[:1]==["--replay"]: replay(a[1],a[2])
     elif a[:1]==["--demo"]: live(0,demo=True)
     elif "--dry" in a: live(0,dry=True)
-    else: live(float(a[a.index("--delay")+1]) if "--delay" in a else 0)
+    else:
+        if "--at-kickoff" in a:                       # leave the lights alone until the game actually starts
+            event,name,_=find_game(TEAM)
+            if not event: sys.exit(f"No {TEAM} game on today's scoreboard.")
+            log("Waiting for kickoff:",name,"- lights untouched until then. Ctrl+C to cancel.")
+            waited=False
+            while True:
+                try:
+                    if fast_play(event,TEAM)[0] not in ("STATUS_SCHEDULED",None): break
+                    waited=True                       # only flash if we really saw the game go from scheduled to live
+                except Exception as e: log("feed hiccup:",e)
+                time.sleep(8)
+        live(float(a[a.index("--delay")+1]) if "--delay" in a else 0, kickoff=("--at-kickoff" in a and waited))
